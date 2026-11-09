@@ -950,3 +950,43 @@ func TestDPoPTokenWithoutRefreshTokenSynchronizesClockBeforeExpiryDecision(t *te
 		t.Fatalf("expired DPoP hint = %q or token still stored", problem.Hint)
 	}
 }
+
+// A command that exhausts its rate-limit retries must leave the same login usable
+// by a later call, without another authorization flow or an in-memory token cache.
+func TestRefreshRecoversOnNextCallAfterRateLimitExhaustion(t *testing.T) {
+	setupStoredTokenTest(t)
+	stored := newRefreshTestToken()
+	if err := SetStoredToken(stored); err != nil {
+		t.Fatal(err)
+	}
+	var limitedCalls atomic.Int32
+	limited := scriptedRefreshClient(t, []refreshHTTPTestStep{
+		{status: http.StatusTooManyRequests, body: "ratelimit triggered"},
+		{status: http.StatusTooManyRequests, body: `{"code":123456,"error":"slow_down"}`},
+	}, &limitedCalls)
+	token, err := GetValidAccessToken(context.Background(), limited, newRefreshTestOptions(stored))
+	problem := requireRefreshProblem(t, err, errs.CategoryAPI, errs.SubtypeRateLimit, true)
+	if token != nil || problem.Code != http.StatusTooManyRequests || limitedCalls.Load() != 2 {
+		t.Fatalf("rate-limited call: token=%v code=%d requests=%d", token != nil, problem.Code, limitedCalls.Load())
+	}
+	if IsNeedUserAuthorizationError(err) {
+		t.Fatal("rate-limited call requested a new authorization")
+	}
+	retained := mustGetStoredToken(t, stored.AppId, stored.UserOpenId)
+	if retained == nil || retained.RefreshToken != stored.RefreshToken || retained.GrantedAt != stored.GrantedAt {
+		t.Fatal("rate-limited call changed or removed the original login")
+	}
+
+	var recoveryCalls atomic.Int32
+	recovered := scriptedRefreshClient(t, []refreshHTTPTestStep{{
+		body: `{"access_token":"access-recovered","refresh_token":"refresh-recovered","expires_in":7200,"refresh_token_expires_in":604800}`,
+	}}, &recoveryCalls)
+	token, err = GetValidAccessToken(context.Background(), recovered, newRefreshTestOptions(stored))
+	if err != nil || token == nil || token.AccessToken != "access-recovered" || recoveryCalls.Load() != 1 {
+		t.Fatalf("recovery call: token=%v requests=%d error=%v", token != nil, recoveryCalls.Load(), err)
+	}
+	persisted := mustGetStoredToken(t, stored.AppId, stored.UserOpenId)
+	if persisted == nil || persisted.RefreshToken != "refresh-recovered" || persisted.GrantedAt != stored.GrantedAt || persisted.Scope != stored.Scope {
+		t.Fatal("recovery did not persist the rotated credential with the original authorization metadata")
+	}
+}
